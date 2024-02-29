@@ -12,15 +12,14 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-sys.path.append("../detr")
-from engine import evaluate, train_one_epoch
-from models import build_model
-import util.misc as utils
-import datasets.transforms as R
+from ..detr.engine import evaluate, train_one_epoch
+from ..detr.models import build_model
+import table_transformer.detr.util.misc as utils
+import table_transformer.detr.datasets.transforms as R
 
-import table_datasets as TD
-from table_datasets import PDFTablesDataset
-from eval import eval_coco
+import table_transformer.src.table_datasets as TD
+from .table_datasets import PDFTablesDataset
+from .eval import eval_coco
 
 
 def get_args():

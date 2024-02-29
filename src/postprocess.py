@@ -223,6 +223,8 @@ def slot_into_containers(container_objects, package_objects, overlap_threshold=0
         match_scores = []
         package_rect = Rect(package['bbox'])
         package_area = package_rect.get_area()        
+        if package_area < 1:
+            continue
         for container_num, container in enumerate(container_objects):
             container_rect = Rect(container['bbox'])
             intersect_area = container_rect.intersect(package['bbox']).get_area()

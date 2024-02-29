@@ -6,6 +6,7 @@ import xml.etree.ElementTree as ET
 import os
 import random
 import io
+import cv2
 
 import torch
 from torchvision import transforms
@@ -19,10 +20,9 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.patches import Patch
 
-from main import get_model
-import postprocess
-sys.path.append("../detr")
-from models import build_model
+from .main import get_model
+import table_transformer.src.postprocess as postprocess
+from ..detr.models import build_model
 
 class MaxResize(object):
     def __init__(self, max_size=800):
@@ -33,17 +33,29 @@ class MaxResize(object):
         current_max_size = max(width, height)
         scale = self.max_size / current_max_size
         resized_image = image.resize((int(round(scale*width)), int(round(scale*height))))
-        
+
         return resized_image
+
+class Blur(object):
+    def __init__(self, size=9, sigmaColor=150, sigmaSpace=150):
+        self.size = size
+        self.sigmaColor = sigmaColor
+        self.sigmaSpace = sigmaSpace
+
+    def __call__(self, image):
+        blured_image = cv2.bilateralFilter(np.array(image),self.size,self.sigmaColor,self.sigmaSpace)
+        return blured_image
 
 detection_transform = transforms.Compose([
     MaxResize(800),
+    Blur(),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
 structure_transform = transforms.Compose([
-    MaxResize(1000),
+    MaxResize(1300),
+    Blur(),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
@@ -64,18 +76,18 @@ def get_class_map(data_type):
     return class_map
 
 detection_class_thresholds = {
-    "table": 0.5,
-    "table rotated": 0.5,
-    "no object": 10
+    "table": 0.50,
+    "table rotated": 0.95,
+    "no object": 3
 }
 
 structure_class_thresholds = {
-    "table": 0.5,
-    "table column": 0.5,
+    "table": 0.70,
+    "table column": 0.7,
     "table row": 0.5,
-    "table column header": 0.5,
-    "table projected row header": 0.5,
-    "table spanning cell": 0.5,
+    "table column header": 0.8,
+    "table projected row header": 0.7,
+    "table spanning cell": 0.7,
     "no object": 10
 }
 
@@ -96,7 +108,7 @@ def get_args():
     parser.add_argument('--structure_model_path', help="The path to the structure model")
     parser.add_argument('--detection_config_path',
                         help="Filepath to the detection model config file")
-    parser.add_argument('--detection_model_path', help="The path to the detection model")                       
+    parser.add_argument('--detection_model_path', help="The path to the detection model")
     parser.add_argument('--detection_device', default="cuda")
     parser.add_argument('--structure_device', default="cuda")
     parser.add_argument('--crops', '-p', action='store_true',
@@ -138,11 +150,11 @@ def iob(bbox1, bbox2):
     Compute the intersection area over box area, for bbox1.
     """
     intersection = Rect(bbox1).intersect(bbox2)
-    
+
     bbox1_area = Rect(bbox1).get_area()
     if bbox1_area > 0:
         return intersection.get_area() / bbox1_area
-    
+
     return 0
 
 
@@ -154,7 +166,7 @@ def align_headers(headers, rows):
     For now, we are not supporting tables with multiple headers, so we need to
     eliminate anything besides the top-most header.
     """
-    
+
     aligned_headers = []
 
     for row in rows:
@@ -243,54 +255,49 @@ def outputs_to_objects(outputs, img_size, class_idx2name):
     objects = []
     for label, score, bbox in zip(pred_labels, pred_scores, pred_bboxes):
         class_label = class_idx2name[int(label)]
+        if (float(bbox[2]) - float(bbox[0]) < 10 or float(bbox[3]) - float(bbox[1]) < 10):
+            continue
         if not class_label == 'no object':
             objects.append({'label': class_label, 'score': float(score),
                             'bbox': [float(elem) for elem in bbox]})
 
     return objects
 
-def objects_to_crops(img, tokens, objects, class_thresholds, padding=10):
+def object_to_crop(img, tokens, obj, padding=10):
     """
     Process the bounding boxes produced by the table detection model into
     cropped table images and cropped tokens.
     """
 
-    table_crops = []
-    for obj in objects:
-        if obj['score'] < class_thresholds[obj['label']]:
-            continue
+    cropped_table = {}
 
-        cropped_table = {}
+    bbox = obj['bbox']
+    bbox = [bbox[0]-padding, bbox[1]-padding, bbox[2]+padding, bbox[3]+padding]
 
-        bbox = obj['bbox']
-        bbox = [bbox[0]-padding, bbox[1]-padding, bbox[2]+padding, bbox[3]+padding]
+    cropped_img = img.crop(bbox)
 
-        cropped_img = img.crop(bbox)
+    table_tokens = [token for token in tokens if iob(token['bbox'], bbox) >= 0.5] if tokens else []
+    for token in table_tokens:
+        token['bbox'] = [token['bbox'][0]-bbox[0],
+                         token['bbox'][1]-bbox[1],
+                         token['bbox'][2]-bbox[0],
+                         token['bbox'][3]-bbox[1]]
 
-        table_tokens = [token for token in tokens if iob(token['bbox'], bbox) >= 0.5]
+    # If table is predicted to be rotated, rotate cropped image and tokens/words:
+    if obj['label'] == 'table rotated':
+        cropped_img = cropped_img.rotate(270, expand=True)
         for token in table_tokens:
-            token['bbox'] = [token['bbox'][0]-bbox[0],
-                             token['bbox'][1]-bbox[1],
-                             token['bbox'][2]-bbox[0],
-                             token['bbox'][3]-bbox[1]]
+            bbox = token['bbox']
+            bbox = [cropped_img.size[0]-bbox[3]-1,
+                    bbox[0],
+                    cropped_img.size[0]-bbox[1]-1,
+                    bbox[2]]
+            token['bbox'] = bbox
 
-        # If table is predicted to be rotated, rotate cropped image and tokens/words:
-        if obj['label'] == 'table rotated':
-            cropped_img = cropped_img.rotate(270, expand=True)
-            for token in table_tokens:
-                bbox = token['bbox']
-                bbox = [cropped_img.size[0]-bbox[3]-1,
-                        bbox[0],
-                        cropped_img.size[0]-bbox[1]-1,
-                        bbox[2]]
-                token['bbox'] = bbox
+    cropped_table['image'] = cropped_img
+    cropped_table['tokens'] = table_tokens
 
-        cropped_table['image'] = cropped_img
-        cropped_table['tokens'] = table_tokens
-
-        table_crops.append(cropped_table)
-
-    return table_crops
+    return cropped_table
 
 def objects_to_structures(objects, tokens, class_thresholds):
     """
@@ -306,8 +313,8 @@ def objects_to_structures(objects, tokens, class_thresholds):
     for table in tables:
         table_objects = [obj for obj in objects if iob(obj['bbox'], table['bbox']) >= 0.5]
         table_tokens = [token for token in tokens if iob(token['bbox'], table['bbox']) >= 0.5]
-        
-        structure = {}
+
+        structure = {'table_score': table['score'] ** len(table_objects)}
 
         columns = [obj for obj in table_objects if obj['label'] == 'table column']
         rows = [obj for obj in table_objects if obj['label'] == 'table row']
@@ -334,7 +341,7 @@ def objects_to_structures(objects, tokens, class_thresholds):
         row_rect = Rect()
         for obj in rows:
             row_rect.include_rect(obj['bbox'])
-        column_rect = Rect() 
+        column_rect = Rect()
         for obj in columns:
             column_rect.include_rect(obj['bbox'])
         table['row_column_bbox'] = [column_rect[0], row_rect[1], column_rect[2], row_rect[3]]
@@ -349,8 +356,12 @@ def objects_to_structures(objects, tokens, class_thresholds):
         structure['column headers'] = column_headers
         structure['spanning cells'] = spanning_cells
 
+        all_obj = rows + columns + column_headers + spanning_cells
         if len(rows) > 0 and len(columns) > 1:
+            structure['mean_score'] = sum(s['score'] for s in all_obj) / len(all_obj)
             structure = refine_table_structure(structure, class_thresholds)
+        else:
+            structure['mean_score'] = 0
 
         table_structures.append(structure)
 
@@ -454,10 +465,10 @@ def structure_to_cells(table_structure, tokens):
     for cell, cell_span_nums in zip(cells, span_nums_by_cell):
         cell_spans = [tokens[num] for num in cell_span_nums]
         # TODO: Refine how text is extracted; should be character-based, not span-based;
-        # but need to associate 
+        # but need to associate
         cell['cell text'] = postprocess.extract_text_from_spans(cell_spans, remove_integer_superscripts=False)
         cell['spans'] = cell_spans
-        
+
     # Adjust the row, column, and cell bounding boxes to reflect the extracted text
     num_rows = len(rows)
     rows = postprocess.sort_objects_top_to_bottom(rows)
@@ -571,7 +582,7 @@ def visualize_detected_tables(img, det_tables, out_path):
     plt.imshow(img, interpolation="lanczos")
     plt.gcf().set_size_inches(20, 20)
     ax = plt.gca()
-    
+
     for det_table in det_tables:
         bbox = det_table['bbox']
 
@@ -589,14 +600,14 @@ def visualize_detected_tables(img, det_tables, out_path):
             hatch='//////'
         else:
             continue
- 
-        rect = patches.Rectangle(bbox[:2], bbox[2]-bbox[0], bbox[3]-bbox[1], linewidth=linewidth, 
+
+        rect = patches.Rectangle(bbox[:2], bbox[2]-bbox[0], bbox[3]-bbox[1], linewidth=linewidth,
                                     edgecolor='none',facecolor=facecolor, alpha=0.1)
         ax.add_patch(rect)
-        rect = patches.Rectangle(bbox[:2], bbox[2]-bbox[0], bbox[3]-bbox[1], linewidth=linewidth, 
+        rect = patches.Rectangle(bbox[:2], bbox[2]-bbox[0], bbox[3]-bbox[1], linewidth=linewidth,
                                     edgecolor=edgecolor,facecolor='none',linestyle='-', alpha=alpha)
         ax.add_patch(rect)
-        rect = patches.Rectangle(bbox[:2], bbox[2]-bbox[0], bbox[3]-bbox[1], linewidth=0, 
+        rect = patches.Rectangle(bbox[:2], bbox[2]-bbox[0], bbox[3]-bbox[1], linewidth=0,
                                     edgecolor=edgecolor,facecolor='none',linestyle='-', hatch=hatch, alpha=0.2)
         ax.add_patch(rect)
 
@@ -608,65 +619,114 @@ def visualize_detected_tables(img, det_tables, out_path):
                         Patch(facecolor=(0.95, 0.6, 0.1), edgecolor=(0.95, 0.6, 0.1),
                                 label='Table (rotated)', hatch='//////', alpha=0.3)]
     plt.legend(handles=legend_elements, bbox_to_anchor=(0.5, -0.02), loc='upper center', borderaxespad=0,
-                    fontsize=10, ncol=2)  
+                    fontsize=10, ncol=2)
     plt.gcf().set_size_inches(10, 10)
     plt.axis('off')
-    plt.savefig(out_path, bbox_inches='tight', dpi=150)
+    #plt.show(out_path, bbox_inches='tight', dpi=150)
+    plt.show()
     plt.close()
 
     return
 
-def visualize_cells(img, cells, out_path):
+def visualize_objects(img, objects, out_path):
     plt.imshow(img, interpolation="lanczos")
     plt.gcf().set_size_inches(20, 20)
     ax = plt.gca()
-    
-    for cell in cells:
-        bbox = cell['bbox']
 
-        if cell['column header']:
+    for obj in objects:
+        bbox = obj['bbox']
+
+        hatch=False
+        if obj.get('column header'):
             facecolor = (1, 0, 0.45)
             edgecolor = (1, 0, 0.45)
             alpha = 0.3
+            linealpha = 0.6
             linewidth = 2
             hatch='//////'
-        elif cell['projected row header']:
+        elif obj.get('projected row header'):
             facecolor = (0.95, 0.6, 0.1)
             edgecolor = (0.95, 0.6, 0.1)
             alpha = 0.3
+            linealpha = 0.6
             linewidth = 2
             hatch='//////'
+        elif 'label' in obj:
+            if obj['label'] == 'table':
+                facecolor = (0, 0, 0)
+                edgecolor = (0, 0, 0)
+                alpha = 0.05
+                linewidth = 8
+                linealpha = 0.6
+                #hatch='\\\\\\\\\\\\'
+            elif obj['label'] == 'table column':
+                facecolor = (1, 0, 0)
+                edgecolor = (1, 0, 0)
+                alpha = 0.1
+                linewidth = 2
+                linealpha = 0.3
+                #hatch='//////'
+            elif obj['label'] == 'table row':
+                facecolor = (0, 1, 0)
+                edgecolor = (0, 1, 0)
+                alpha = 0.1
+                linewidth = 2
+                linealpha = 0.3
+                #hatch='\\\\\\\\\\\\'
+            elif obj['label'] == 'table column header':
+                facecolor = (0, 1, 1)
+                edgecolor = (0, 1, 1)
+                alpha = 0.1
+                linealpha = 0.3
+                linewidth = 2
+                hatch='\\\\\\\\\\\\'
+            elif "LINE" in obj['label']:
+                facecolor = (0, 1, 1)
+                edgecolor = (0, 1, 1)
+                alpha = 0.1
+                linealpha = 0.8
+                linewidth = 1
+                hatch='\\\\\\\\\\\\'
+            elif "LINE" in obj['label']:
+                facecolor = (0, 1, 1)
+                edgecolor = (0, 1, 1)
+                alpha = 0.1
+                linealpha = 0.8
+                linewidth = 1
+                hatch='\\\\\\\\\\\\'
+            elif obj['label'] in [ "UNKOWN", "FLOWING_TEXT", "HEADING_TEXT", "PULLOUT_TEXT", "TABLE", "VERTICAL_TEXT", "CAPTION_TEXT", "FLOWING_IMAGE", "HEADING_IMAGE", "PULLOUT_IMAGE" ]:
+                facecolor = (1, 0.5, 0.2)
+                edgecolor = (1, 0.5, 0.2)
+                alpha = 0.5 * obj['score']
+                linealpha = 0.7
+                linewidth = 0.2
+                hatch='\\\\\\\\\\\\'
         else:
-            facecolor = (0.3, 0.74, 0.8)
-            edgecolor = (0.3, 0.7, 0.6)
-            alpha = 0.3
+            facecolor = (1, 0, 1)
+            edgecolor = (1, 0, 1)
+            alpha = 0.1
+            linealpha = 0.6
             linewidth = 2
-            hatch='\\\\\\\\\\\\'
- 
-        rect = patches.Rectangle(bbox[:2], bbox[2]-bbox[0], bbox[3]-bbox[1], linewidth=linewidth, 
-                                    edgecolor='none',facecolor=facecolor, alpha=0.1)
+            hatch='///////'
+
+        rect = patches.Rectangle(bbox[:2], bbox[2]-bbox[0], bbox[3]-bbox[1], linewidth=linewidth,
+                                    edgecolor='none',facecolor=facecolor, alpha=alpha)
         ax.add_patch(rect)
-        rect = patches.Rectangle(bbox[:2], bbox[2]-bbox[0], bbox[3]-bbox[1], linewidth=linewidth, 
-                                    edgecolor=edgecolor,facecolor='none',linestyle='-', alpha=alpha)
+        rect = patches.Rectangle(bbox[:2], bbox[2]-bbox[0], bbox[3]-bbox[1], linewidth=linewidth,
+                                    edgecolor=edgecolor,facecolor='none',linestyle='-', alpha=linealpha)
         ax.add_patch(rect)
-        rect = patches.Rectangle(bbox[:2], bbox[2]-bbox[0], bbox[3]-bbox[1], linewidth=0, 
-                                    edgecolor=edgecolor,facecolor='none',linestyle='-', hatch=hatch, alpha=0.2)
-        ax.add_patch(rect)
+        if (hatch):
+            rect = patches.Rectangle(bbox[:2], bbox[2]-bbox[0], bbox[3]-bbox[1], linewidth=0,
+                                        edgecolor=edgecolor,facecolor='none',linestyle='-', hatch=hatch, alpha=linealpha)
+            ax.add_patch(rect)
 
     plt.xticks([], [])
     plt.yticks([], [])
 
-    legend_elements = [Patch(facecolor=(0.3, 0.74, 0.8), edgecolor=(0.3, 0.7, 0.6),
-                                label='Data cell', hatch='\\\\\\\\\\\\', alpha=0.3),
-                        Patch(facecolor=(1, 0, 0.45), edgecolor=(1, 0, 0.45),
-                                label='Column header cell', hatch='//////', alpha=0.3),
-                        Patch(facecolor=(0.95, 0.6, 0.1), edgecolor=(0.95, 0.6, 0.1),
-                                label='Projected row header cell', hatch='//////', alpha=0.3)]
-    plt.legend(handles=legend_elements, bbox_to_anchor=(0.5, -0.02), loc='upper center', borderaxespad=0,
-                    fontsize=10, ncol=3)  
     plt.gcf().set_size_inches(10, 10)
     plt.axis('off')
     plt.savefig(out_path, bbox_inches='tight', dpi=150)
+    #plt.show()
     plt.close()
 
     return
@@ -724,9 +784,9 @@ class TableExtractionPipeline(object):
 
 
     def __call__(self, page_image, page_tokens=None):
-        return self.extract(self, page_image, page_tokens)
+        return self.extract(page_image, page_tokens)
 
-    def detect(self, img, tokens=None, out_objects=True, out_crops=False, crop_padding=10):
+    def detect(self, img, tokens=None, out_crops=False, crop_padding=10):
         out_formats = {}
         if self.det_model is None:
             print("No detection model loaded.")
@@ -740,18 +800,13 @@ class TableExtractionPipeline(object):
 
         # Post-process detected objects, assign class labels
         objects = outputs_to_objects(outputs, img.size, self.det_class_idx2name)
-        if out_objects:
-            out_formats['objects'] = objects
-        if not out_crops:
-            return out_formats
+        objects = [ o for o in objects if o['score'] > self.det_class_thresholds[o['label']] ]
 
         # Crop image and tokens for detected table
-        if out_crops:
-            tables_crops = objects_to_crops(img, tokens, objects, self.det_class_thresholds,
-                                            padding=crop_padding)
-            out_formats['crops'] = tables_crops
+        for obj in objects:
+            obj['crop'] = object_to_crop(img, tokens, obj, padding=crop_padding)
 
-        return out_formats
+        return objects
 
     def recognize(self, img, tokens=None, out_objects=False, out_cells=False,
                   out_html=False, out_csv=False):
@@ -772,18 +827,19 @@ class TableExtractionPipeline(object):
 
         # Post-process detected objects, assign class labels
         objects = outputs_to_objects(outputs, img.size, self.str_class_idx2name)
+        objects = [ o for o in objects if o['score'] > self.str_class_thresholds[o['label']] ]
         if out_objects:
             out_formats['objects'] = objects
         if not (out_cells or out_html or out_csv):
             return out_formats
 
-        # Further process the detected objects so they correspond to a consistent table 
         tables_structure = objects_to_structures(objects, tokens, self.str_class_thresholds)
-
-        # Enumerate all table cells: grid cells and spanning cells
-        tables_cells = [structure_to_cells(structure, tokens)[0] for structure in tables_structure]
+        tables_cells = [
+                { ("structure","cells","token_score")[i] : cells for i, cells in enumerate((structure,) + structure_to_cells(structure, tokens)) }
+                for structure in tables_structure
+            ]
         if out_cells:
-            out_formats['cells'] = tables_cells
+            out_formats['structs'] = tables_cells
         if not (out_html or out_csv):
             return out_formats
 
@@ -792,7 +848,7 @@ class TableExtractionPipeline(object):
             tables_htmls = [cells_to_html(cells) for cells in tables_cells]
             out_formats['html'] = tables_htmls
 
-        # Convert cells to CSV, including flattening multi-row column headers to a single row 
+        # Convert cells to CSV, including flattening multi-row column headers to a single row
         if out_csv:
             tables_csvs = [cells_to_csv(cells) for cells in tables_cells]
             out_formats['csv'] = tables_csvs
@@ -802,23 +858,34 @@ class TableExtractionPipeline(object):
     def extract(self, img, tokens=None, out_objects=True, out_crops=False, out_cells=False,
                 out_html=False, out_csv=False, crop_padding=10):
 
-        detect_out = self.detect(img, tokens=tokens, out_objects=False, out_crops=True,
-                                 crop_padding=crop_padding)
-        cropped_tables = detect_out['crops']
+        detect_out = self.detect(img, tokens=tokens, crop_padding=crop_padding)
 
+        detected = []
+        for a in detect_out:
+            try:
+                for b in detect_out:
+                    if (a != b and a['score'] < b['score'] and iob(a['bbox'], b['bbox']) > 0.50):
+                        raise Break
+                detected.append(a)
+            except Break:
+                pass
         extracted_tables = []
-        for table in cropped_tables:
-            img = table['image']
-            tokens = table['tokens']
+        for table in detected:
+            img = table['crop']['image']
+            tokens = table['crop']['tokens']
 
             extracted_table = self.recognize(img, tokens=tokens, out_objects=out_objects,
                                        out_cells=out_cells, out_html=out_html, out_csv=out_csv)
             extracted_table['image'] = img
             extracted_table['tokens'] = tokens
+            extracted_table['detected_score'] = table['score']
+            extracted_table['tables_score'] = table['score']
             extracted_tables.append(extracted_table)
 
         return extracted_tables
 
+class Break(Exception):
+    pass
 
 def output_result(key, val, args, img, img_file):
     if key == 'objects':
@@ -857,7 +924,7 @@ def output_result(key, val, args, img, img_file):
                     f.write(elem)
                 if args.verbose:
                     print(elem)
-                        
+
 
 def main():
     args = get_args()
@@ -871,9 +938,9 @@ def main():
     print("Creating inference pipeline")
     pipe = TableExtractionPipeline(det_device=args.detection_device,
                                    str_device=args.structure_device,
-                                   det_config_path=args.detection_config_path, 
+                                   det_config_path=args.detection_config_path,
                                    det_model_path=args.detection_model_path,
-                                   str_config_path=args.structure_config_path, 
+                                   str_config_path=args.structure_config_path,
                                    str_model_path=args.structure_model_path)
 
     # Load images

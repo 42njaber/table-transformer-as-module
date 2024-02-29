@@ -17,7 +17,7 @@ from torchvision.transforms import functional as F
 
 # Project imports
 sys.path.append("detr")
-import datasets.transforms as R
+import table_transformer.detr.datasets.transforms as R
 
 
 def read_pascal_voc(xml_file: str, class_map=None):

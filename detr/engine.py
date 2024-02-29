@@ -9,9 +9,9 @@ from typing import Iterable
 
 import torch
 
-import util.misc as utils
-from datasets.coco_eval import CocoEvaluator
-from datasets.panoptic_eval import PanopticEvaluator
+import table_transformer.detr.util.misc as utils
+from table_transformer.detr.datasets.coco_eval import CocoEvaluator
+from table_transformer.detr.datasets.panoptic_eval import PanopticEvaluator
 
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,

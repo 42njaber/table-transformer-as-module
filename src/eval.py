@@ -22,11 +22,11 @@ from fitz import Rect
 from PIL import Image
 
 sys.path.append("../detr")
-import util.misc as utils
-from datasets.coco_eval import CocoEvaluator
-import postprocess
-import grits
-from grits import grits_con, grits_top, grits_loc
+import table_transformer.detr.util.misc as utils
+from ..detr.datasets.coco_eval import CocoEvaluator
+import table_transformer.src.postprocess
+import table_transformer.src.grits
+from table_transformer.src.grits import grits_con, grits_top, grits_loc
 
 
 structure_class_names = [
